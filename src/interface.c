@@ -28,6 +28,7 @@
 #include <ncurses.h>
 #include <signal.h>
 #include <inttypes.h>
+#include <assert.h>
 
 #define DEVICE_ID_SIZE 16
 
@@ -65,7 +66,22 @@ struct all_gpu_processes {
   bool is_graphical;
 };
 
+enum window_type {
+  window_type_process,
+  window_type_plot,
+};
+
+static const unsigned int option_window_size = 13;
+struct option_window {
+  enum nvtop_option_window_state state;
+  unsigned int selected_row;
+  unsigned int offset;
+  WINDOW *option_win;
+  WINDOW *option_selection_window;
+};
+
 struct process_window {
+  enum window_type type;
   unsigned int size_biggest_name;
   unsigned int size_processes_buffer;
   unsigned int num_processes;
@@ -75,24 +91,27 @@ struct process_window {
   unsigned int selected_row;
   enum process_field sort_criterion;
   bool sort_asc;
+  struct option_window option_window;
 };
 
-struct option_window {
-  enum nvtop_option_window_state state;
-  unsigned int selected_row;
-  unsigned int offset;
-  WINDOW *option_win;
-  WINDOW *option_selection_window;
+struct plot_window {
+  enum window_type type;
+  unsigned num_minutes;
+  size_t num_data;
+  double *data;
+  WINDOW *win;
 };
 
-static const unsigned int option_window_size = 13;
+struct window_position {
+  int posX, posY, sizeX, sizeY;
+};
 
 struct nvtop_interface {
   size_t num_devices;
   struct device_window *devices_win;
   struct process_window process;
-  struct option_window option_window;
   bool use_fahrenheit;
+  struct plot_window *plots;
 };
 
 enum device_field {
@@ -126,12 +145,14 @@ static unsigned int sizeof_process_field[] = {
 enum ui_window_size_id {
   ui_window_gpu_info,
   ui_window_process_info,
+  ui_window_plot,
   ui_window_option_selection,
 };
 
 static unsigned int sizeof_ui_windows[] = {
   [ui_window_gpu_info] = 4,
   [ui_window_process_info] = 0,
+  [ui_window_plot] = 0,
   [ui_window_option_selection] = 1,
 };
 
@@ -275,8 +296,89 @@ static void alloc_process_with_option(struct nvtop_interface *interface,
           interface->num_devices * sizeof_ui_windows[ui_window_gpu_info],
           cols_offset);
   } else {
-    interface->option_window.state = nvtop_option_state_hidden;
+    interface->process.option_window.state = nvtop_option_state_hidden;
   }
+}
+
+static void alloc_plot_window(struct nvtop_interface *interface,
+                               bool alloc_place_for_option) {
+
+}
+
+/*
+ * Interface layout grammar: D+N((P|C+)N)*
+ * where  D = Device column
+ *        N = New block
+ *        P = Process block
+ *        C = Chart block
+ */
+
+static void compute_sizes_from_layout(const struct nvtop_interface *interface,
+                                      struct window_position *device_positions,
+                                      struct window_position *process_position,
+                                      struct window_position **plot_position,
+                                      const char interfaceLayout[]) {
+
+  // Vertical layout
+
+  char on_top = '\0';
+  unsigned num_device_columns = 0;
+  unsigned num_separators = 0;
+  unsigned num_plot_blocks = 0;
+  unsigned num_plot_windows = 0;
+  size_t pos_in_string = 0;
+  bool previous_was_new_line = false;
+  for (char layoutC = interfaceLayout[pos_in_string]; layoutC != '\0';
+       layoutC = interfaceLayout[++pos_in_string]) {
+    switch(layoutC) {
+      case 'D':
+        num_device_columns++;
+        break;
+      case 'N':
+        previous_was_new_line = true;
+        break;
+      case 'P':
+        if (previous_was_new_line) {
+          if(on_top != 'P')
+            num_separators++;
+          previous_was_new_line = false;
+        }
+        on_top = 'P';
+        break;
+      case 'C':
+        if (previous_was_new_line) {
+          if(on_top != 'C') {
+            num_separators++;
+            num_plot_blocks++;
+          }
+          previous_was_new_line = false;
+        }
+        num_plot_windows++;
+        on_top = 'C';
+        break;
+      default:
+        break;
+    }
+  }
+
+  int rows, cols;
+  getmaxyx(stdscr, rows, cols);
+
+  // Device positions
+  unsigned window_height = 3; // Stay with 3 lines per window for the moment
+  unsigned device_top = 0;
+  unsigned num_device_block_lines = (interface->num_devices + num_device_columns - 1) % num_device_columns;
+  unsigned device_bottom = window_height * num_device_block_lines + num_device_block_lines - 1; // win height plus space between windows
+  unsigned current_in_line = 0;
+  unsigned current_posX = 0;
+  unsigned current_posY = 0;
+  for (unsigned i = 0; i < interface->num_devices; ++i) {
+    device_positions[i].posX = current_posX;
+    device_positions[i].posY = current_posY;
+    /*device_positions[i].sizeX = ;*/
+  }
+  
+  /**plot_position = malloc(num_plot_windows * sizeof(**plot_position));*/
 }
 
 static void initialize_all_windows(struct nvtop_interface *dwin) {
@@ -289,13 +391,14 @@ static void initialize_all_windows(struct nvtop_interface *dwin) {
         cols, &dwin->devices_win[i]);
   }
 
+  alloc_plot_window(dwin, dwin->process.option_window.state != nvtop_option_state_hidden);
   alloc_process_with_option(dwin,
-      dwin->option_window.state != nvtop_option_state_hidden);
-  dwin->option_window.option_win =
+      dwin->process.option_window.state != nvtop_option_state_hidden);
+  dwin->process.option_window.option_win =
     newwin(sizeof_ui_windows[ui_window_process_info], option_window_size,
         num_devices * sizeof_ui_windows[ui_window_gpu_info], 0);
 
-  dwin->option_window.option_selection_window =
+  dwin->process.option_window.option_selection_window =
     newwin(sizeof_ui_windows[ui_window_option_selection], cols, rows-1, 0);
 }
 
@@ -306,8 +409,8 @@ static void delete_all_windows(
   }
   delwin(dwin->process.process_win);
   dwin->process.process_win = NULL;
-  delwin(dwin->option_window.option_selection_window);
-  delwin(dwin->option_window.option_win);
+  delwin(dwin->process.option_window.option_selection_window);
+  delwin(dwin->process.option_window.option_win);
 }
 
 void show_gpu_infos_ascii(
@@ -372,8 +475,8 @@ struct nvtop_interface* initialize_curses(
   curs_set(0);
   interface->use_fahrenheit = use_fahrenheit;
   interface->process.offset = 0;
-  interface->option_window.offset = 0;
-  interface->option_window.state = nvtop_option_state_hidden;
+  interface->process.option_window.offset = 0;
+  interface->process.option_window.state = nvtop_option_state_hidden;
   interface->process.selected_row = 0;
   interface->process.sort_criterion = process_memory;
   interface->process.sort_asc = true;
@@ -964,7 +1067,7 @@ static void draw_processes(
     return;
   unsigned int num_devices = interface->num_devices;
   unsigned int total_processes = 0;
-  if (interface->option_window.state == nvtop_option_state_hidden) {
+  if (interface->process.option_window.state == nvtop_option_state_hidden) {
     total_processes = copy_processes_for_processing(num_devices,
         dev_info, interface);
     interface->process.num_processes = total_processes;
@@ -1062,7 +1165,7 @@ SIGXFSZ  ,
 static const size_t nvtop_num_signals = 28;
 
 static void draw_kill_option(struct nvtop_interface *interface) {
-  WINDOW *win = interface->option_window.option_win;
+  WINDOW *win = interface->process.option_window.option_win;
   wattron(win, COLOR_PAIR(green_color) | A_REVERSE);
   mvwprintw(win, 0, 0, "Send signal:");
   wattroff(win, COLOR_PAIR(green_color) | A_REVERSE);
@@ -1070,11 +1173,11 @@ static void draw_kill_option(struct nvtop_interface *interface) {
   int rows, cols;
   getmaxyx(win, rows, cols);
 
-  size_t start_at_option = interface->option_window.offset;
+  size_t start_at_option = interface->process.option_window.offset;
   size_t end_at_option = start_at_option + rows - 1;
 
   for (size_t i = start_at_option; i < end_at_option && i <= nvtop_num_signals; ++i) {
-    if (i == interface->option_window.selected_row) {
+    if (i == interface->process.option_window.selected_row) {
       wattron(win, COLOR_PAIR(cyan_color) | A_STANDOUT);
     }
     wprintw(win, "%*d %s", 2, i, signalsName[i]);
@@ -1082,7 +1185,7 @@ static void draw_kill_option(struct nvtop_interface *interface) {
 
     for (unsigned int j = cols; j < option_window_size; ++j)
       wprintw(win, " ");
-    if (i == interface->option_window.selected_row) {
+    if (i == interface->process.option_window.selected_row) {
       wattroff(win, COLOR_PAIR(cyan_color) | A_STANDOUT);
       mvwprintw(win, rows, option_window_size-1, " ");
     }
@@ -1091,21 +1194,21 @@ static void draw_kill_option(struct nvtop_interface *interface) {
 }
 
 static void draw_sort_option(struct nvtop_interface *interface) {
-  WINDOW *win = interface->option_window.option_win;
+  WINDOW *win = interface->process.option_window.option_win;
   wattron(win, COLOR_PAIR(green_color) | A_REVERSE);
   mvwprintw(win, 0, 0, "Sort by     ");
   wattroff(win, COLOR_PAIR(green_color) | A_REVERSE);
   wprintw(win, " ");
   int rows, cols;
-  if (interface->option_window.offset == 0) {
-    if (interface->option_window.selected_row == 0) {
+  if (interface->process.option_window.offset == 0) {
+    if (interface->process.option_window.selected_row == 0) {
       wattron(win, COLOR_PAIR(cyan_color) | A_STANDOUT);
     }
     wprintw(win, "Cancel");
     getyx(win, rows, cols);
     for (unsigned int j = cols; j < option_window_size; ++j)
       wprintw(win, " ");
-    if (interface->option_window.selected_row == 0) {
+    if (interface->process.option_window.selected_row == 0) {
       wattroff(win, COLOR_PAIR(cyan_color) | A_STANDOUT);
       mvwprintw(win, rows, option_window_size-1, " ");
     }
@@ -1113,23 +1216,23 @@ static void draw_sort_option(struct nvtop_interface *interface) {
   getmaxyx(win, rows, cols);
 
   size_t start_at_option =
-    interface->option_window.offset == 0 ?
-    interface->option_window.offset :
-    interface->option_window.offset- 1;
+    interface->process.option_window.offset == 0 ?
+    interface->process.option_window.offset :
+    interface->process.option_window.offset- 1;
   size_t end_at_option =
-    interface->option_window.offset == 0 ?
+    interface->process.option_window.offset == 0 ?
     start_at_option + rows - 2 :
     start_at_option + rows - 1;
 
   for (size_t i = start_at_option; i < end_at_option && i < process_end; ++i) {
-    if (i+1 == interface->option_window.selected_row) {
+    if (i+1 == interface->process.option_window.selected_row) {
       wattron(win, COLOR_PAIR(cyan_color) | A_STANDOUT);
     }
     wprintw(win, "%s", columnName[i]);
     getyx(win, rows, cols);
     for (unsigned int j = cols; j < option_window_size; ++j)
       wprintw(win, " ");
-    if (i+1 == interface->option_window.selected_row) {
+    if (i+1 == interface->process.option_window.selected_row) {
       wattroff(win, COLOR_PAIR(cyan_color) | A_STANDOUT);
       mvwprintw(win, rows, option_window_size-1, " ");
     }
@@ -1139,11 +1242,11 @@ static void draw_sort_option(struct nvtop_interface *interface) {
 
 static void draw_options(struct nvtop_interface *interface) {
   unsigned int rows, cols;
-  getmaxyx(interface->option_window.option_win, rows, cols);
+  getmaxyx(interface->process.option_window.option_win, rows, cols);
   rows -= 1;
   (void) cols;
   unsigned int num_options = 0;
-  switch (interface->option_window.state) {
+  switch (interface->process.option_window.state) {
     case nvtop_option_state_kill:
       num_options = nvtop_num_signals + 1; // Option + Cancel
       break;
@@ -1156,12 +1259,12 @@ static void draw_options(struct nvtop_interface *interface) {
   }
 
   update_selected_offset_with_window_size(
-      &interface->option_window.selected_row,
-      &interface->option_window.offset,
+      &interface->process.option_window.selected_row,
+      &interface->process.option_window.offset,
       rows,
       num_options);
 
-  switch (interface->option_window.state) {
+  switch (interface->process.option_window.state) {
     case nvtop_option_state_kill:
       draw_kill_option(interface);
       break;
@@ -1195,9 +1298,9 @@ static const char *option_selection_kill[][2] = {
 static const unsigned int option_selection_width = 8;
 
 static void draw_option_selection(struct nvtop_interface *interface) {
-  WINDOW *win = interface->option_window.option_selection_window;
+  WINDOW *win = interface->process.option_window.option_selection_window;
   wmove(win, 0, 0);
-  switch(interface->option_window.state) {
+  switch(interface->process.option_window.state) {
     case nvtop_option_state_hidden:
       for (size_t i = 0; i < 3; ++i) {
         wprintw(win, "F%zu", i+1);
@@ -1248,7 +1351,7 @@ void draw_gpu_info_ncurses(
 
   draw_devices(dev_info, interface);
   draw_processes(dev_info, interface);
-  if (interface->option_window.state != nvtop_option_state_hidden)
+  if (interface->process.option_window.state != nvtop_option_state_hidden)
     draw_options(interface);
   draw_option_selection(interface);
   doupdate();
@@ -1262,55 +1365,55 @@ void update_window_size_to_terminal_size(struct nvtop_interface *inter) {
   refresh();
   refresh();
   delete_all_windows(inter);
-  struct option_window options = inter->option_window;
+  struct option_window options = inter->process.option_window;
   initialize_all_windows(inter);
-  inter->option_window.selected_row = options.selected_row;
-  inter->option_window.state = options.state;
+  inter->process.option_window.selected_row = options.selected_row;
+  inter->process.option_window.state = options.state;
 }
 
 bool is_escape_for_quit(struct nvtop_interface *inter) {
-  if (inter->option_window.state == nvtop_option_state_hidden)
+  if (inter->process.option_window.state == nvtop_option_state_hidden)
     return true;
   else
     return false;
 }
 
 static void option_do_kill(struct nvtop_interface *inter) {
-  if (inter->option_window.selected_row == 0)
+  if (inter->process.option_window.selected_row == 0)
     return;
   pid_t pid = inter->process.all_process[inter->process.selected_row].pid;
-  int sig = signalsValues[inter->option_window.selected_row-1];
+  int sig = signalsValues[inter->process.option_window.selected_row-1];
   kill(pid,sig);
 }
 
 static void option_change_sort(struct nvtop_interface *inter) {
-  if (inter->option_window.selected_row == 0)
+  if (inter->process.option_window.selected_row == 0)
     return;
-  inter->process.sort_criterion = process_pid + inter->option_window.selected_row - 1;
+  inter->process.sort_criterion = process_pid + inter->process.option_window.selected_row - 1;
 }
 
 void interface_key(int keyId, struct nvtop_interface *inter) {
   switch(keyId) {
       case KEY_F(1):
-        if (inter->option_window.state == nvtop_option_state_hidden) {
-          inter->option_window.state = nvtop_option_state_kill;
-          inter->option_window.selected_row = 0;
+        if (inter->process.option_window.state == nvtop_option_state_hidden) {
+          inter->process.option_window.state = nvtop_option_state_kill;
+          inter->process.option_window.selected_row = 0;
           alloc_process_with_option(inter, true);
         }
         break;
       case KEY_F(2):
-        if (inter->option_window.state == nvtop_option_state_hidden) {
-          inter->option_window.state = nvtop_option_state_sort_by;
-          inter->option_window.selected_row = 0;
+        if (inter->process.option_window.state == nvtop_option_state_hidden) {
+          inter->process.option_window.state = nvtop_option_state_sort_by;
+          inter->process.option_window.selected_row = 0;
           alloc_process_with_option(inter, true);
         }
         break;
       case KEY_UP:
-        switch (inter->option_window.state) {
+        switch (inter->process.option_window.state) {
           case nvtop_option_state_kill:
           case nvtop_option_state_sort_by:
-            if (inter->option_window.selected_row != 0)
-              inter->option_window.selected_row --;
+            if (inter->process.option_window.selected_row != 0)
+              inter->process.option_window.selected_row --;
             break;
           case nvtop_option_state_hidden:
             if (inter->process.selected_row != 0)
@@ -1321,10 +1424,10 @@ void interface_key(int keyId, struct nvtop_interface *inter) {
         }
         break;
       case KEY_DOWN:
-        switch (inter->option_window.state) {
+        switch (inter->process.option_window.state) {
           case nvtop_option_state_kill:
           case nvtop_option_state_sort_by:
-              inter->option_window.selected_row ++;
+              inter->process.option_window.selected_row ++;
             break;
           case nvtop_option_state_hidden:
               inter->process.selected_row ++;
@@ -1341,15 +1444,15 @@ void interface_key(int keyId, struct nvtop_interface *inter) {
         break;
       case '\n':
       case KEY_ENTER:
-        switch (inter->option_window.state) {
+        switch (inter->process.option_window.state) {
           case nvtop_option_state_kill:
             option_do_kill(inter);
-            inter->option_window.state = nvtop_option_state_hidden;
+            inter->process.option_window.state = nvtop_option_state_hidden;
             alloc_process_with_option(inter, false);
             break;
           case nvtop_option_state_sort_by:
             option_change_sort(inter);
-            inter->option_window.state = nvtop_option_state_hidden;
+            inter->process.option_window.state = nvtop_option_state_hidden;
             alloc_process_with_option(inter, false);
             break;
           case nvtop_option_state_hidden:
@@ -1359,7 +1462,7 @@ void interface_key(int keyId, struct nvtop_interface *inter) {
         break;
       case 27:
         alloc_process_with_option(inter, false);
-        inter->option_window.state = nvtop_option_state_hidden;
+        inter->process.option_window.state = nvtop_option_state_hidden;
         break;
       default:
         break;
