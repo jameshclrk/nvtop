@@ -50,7 +50,11 @@ set_property(TARGET ncurses PROPERTY
 
 include(cmake/compiler-flags.cmake)
 
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64le")
+set(CMAKE_C_FLAGS_RELEASE "-O3 -mtune=powerpc64le")
+else()
 set(CMAKE_C_FLAGS_RELEASE "-O3 -mtune=generic")
+endif()
 set(CMAKE_C_FLAGS_DEBUG
   "${COMPILER_AVALIABLE_WARNINGS} ${COMPILER_ADDRESS_SANITIZER_FLAG} ${COMPILER_UNDEFINED_SANITIZER_FLAG} -Og -g")
 set(CMAKE_C_FLAGS_OPTIMIZED
